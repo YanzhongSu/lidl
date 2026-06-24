@@ -763,9 +763,9 @@ def parse_receipts(args: argparse.Namespace) -> None:
         meta = meta_lookup.get(receipt_id, {})
         try:
             data = read_json(raw_file)
-            ticket = data.get("ticket", {})
-            receipt_html = ticket.get("htmlPrintedReceipt") or ""
-            store = ticket.get("store") or {}
+            ticket = data.get("ticket") or data
+            receipt_html = ticket.get("htmlPrintedReceipt") or ticket.get("htmlReceipt") or ""
+            store = ticket.get("store") or data.get("store") or {}
             if not receipt_html:
                 errors.append({"id": receipt_id, "error": "no htmlPrintedReceipt"})
                 continue
@@ -773,12 +773,12 @@ def parse_receipts(args: argparse.Namespace) -> None:
             parsed.append(
                 {
                     "id": receipt_id,
-                    "date": ticket.get("date") or meta.get("date"),
+                    "date": ticket.get("date") or data.get("date") or meta.get("date"),
                     "store_name": store.get("name") or meta.get("store"),
                     "store_address": store.get("address"),
                     "store_postcode": store.get("postalCode"),
                     "locality": store.get("locality"),
-                    "total_amount": result["total_amount"] if result["total_amount"] is not None else meta.get("totalAmount"),
+                    "total_amount": result["total_amount"] if result["total_amount"] is not None else ticket.get("totalAmount") or meta.get("totalAmount"),
                     "payment_method": result["payment_method"],
                     "card_last4": result["card_last4"],
                     "vat_breakdown": result["vat_breakdown"],
