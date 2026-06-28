@@ -13,7 +13,7 @@ Use this skill to export a user's Lidl UK receipt history into deterministic loc
 - `./data/receipts/{id}.json` for each raw receipt detail response.
 - `./data/receipts_detail.json` for parsed receipt, article, discount, VAT, payment, and spend data.
 
-Use the authentication method that fits the runtime. If the agent is definitely running on a machine with an interactive browser UI, Playwright browser auth state can avoid repeated cookie pasting. If the agent is running on a VM, container, remote worker, CI job, or any environment without browser UI, copied-cookie mode is the correct path. Do not hardcode or commit credentials, cookies, tokens, or auth state.
+Use the authentication method that fits the runtime. If the agent is definitely running on a machine with an interactive browser UI, Playwright browser auth state can avoid repeated cookie pasting. If the agent has access to the user's already logged-in Chrome session through Playwright MCP / computer-use, the fastest path is often to call the Lidl receipt API from that logged-in page context and then save only aggregate/raw receipt JSON locally. If the agent is running on a VM, container, remote worker, CI job, or any environment without browser UI, copied-cookie mode is the correct path. Do not hardcode or commit credentials, cookies, tokens, or auth state.
 
 ## Workflow
 
@@ -30,6 +30,7 @@ Authentication decision:
 - If the command does not need Lidl API access, do not authenticate.
 - If a valid copied cookie is already available in context, use `--cookie-stdin` or `LIDL_COOKIE`.
 - If the agent is on a VM/headless/remote environment without browser UI, ask the user for the full `Cookie` request header from a logged-in Lidl browser request and use `--cookie-stdin` or `LIDL_COOKIE`.
+- If the agent can access the user's already logged-in Chrome session and the page is authenticated (`/mla/` shows the account page), use the browser-session API fallback below before asking for cookies or passwords.
 - If, and only if, the agent is definitely on a local machine with interactive browser UI, use `--login` to reuse `./data/lidl_auth_state.json`. If that state is missing or expired, use `auth-check --login --auth-interactive` and ask the user to complete the login in the opened browser.
 - Do not attempt headless credential login as the primary strategy. Lidl may reject automated credential submission with `Oops! something went wrong, please try again later.`
 
@@ -107,6 +108,48 @@ Use `--data-dir`, `--country`, `--language-code`, or `--rate` only when the user
 
 Use `--insecure` only when the local Python TLS trust store rejects the connection with a certificate-chain error in a controlled environment.
 
+## Browser-session API fallback
+
+Use this when Playwright MCP / computer-use can access the user's logged-in Chrome session and the helper script's `--login` path cannot bootstrap auth quickly. This avoids reading or typing saved passwords.
+
+1. Navigate to the Lidl account page and verify it is already logged in:
+
+```text
+https://www.lidl.co.uk/mla/?country_code=gb&language=en-GB&client_id=GreatBritainRetailClient
+```
+
+2. Find the local checkpoint from existing summaries:
+
+```bash
+python3 scripts/lidl_receipts.py --data-dir /Users/yanzhongsu/data status
+```
+
+3. From the authenticated page context, fetch new summaries and details with `fetch(..., {credentials: 'include'})`. Lidl summary pages are 1-indexed; `page=0` returns `400`, while `page=1` returns the newest receipts.
+
+```js
+async () => {
+  const cutoff = new Date('CHECKPOINT_ISO_Z');
+  const sr = await fetch('https://www.lidl.co.uk/mre/api/v1/tickets?country=GB&page=1', {credentials: 'include'});
+  const summariesPayload = await sr.json();
+  const newSummaries = summariesPayload.items.filter(x => new Date(x.date) > cutoff);
+  const details = {};
+  for (const s of newSummaries) {
+    const r = await fetch(`https://www.lidl.co.uk/mre/api/v1/tickets/${s.id}?country=GB&languageCode=en-GB`, {credentials: 'include'});
+    details[s.id] = await r.json();
+  }
+  return {fetched_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'), summariesPayload, newSummaries, details};
+}
+```
+
+4. Save each `details[id]` to `./data/receipts/{id}.json`, prepend/merge `newSummaries` into `./data/receipts_summaries.json` without duplicating ids, update `./data/receipts/_manifest.json`, then run:
+
+```bash
+python3 scripts/lidl_receipts.py --data-dir /Users/yanzhongsu/data parse
+python3 scripts/lidl_receipts.py --data-dir /Users/yanzhongsu/data status
+```
+
+5. Report the new receipts only. Never print or store cookies, `authToken`, `customer-info`, `ldi-session-info`, or other browser credential values.
+
 ## Efficient Query Recipes
 
 For "since last time we checked":
@@ -145,6 +188,7 @@ Parsing notes:
 ## Failure Handling
 
 - If an API call returns `401` or `403`, refresh the chosen auth method. On VM/headless runs, ask for a fresh copied Cookie header. On local interactive-browser runs, rerun `auth-check --login --auth-interactive`.
+- If using the browser-session API fallback, ensure the account page is actually logged in first, call summary `page=1` not `page=0`, and fetch details from the same page context with `credentials: 'include'`.
 - If detail fetching stops partway through, rerun `details` or `all`; existing receipt files are skipped.
 - If parsing reports missing HTML receipts, keep the raw JSON files and summarize the affected receipt ids.
 - Keep credentials, cookies, tokens, and auth state out of commits and final answers.
