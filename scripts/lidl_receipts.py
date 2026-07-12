@@ -547,383 +547,495 @@ def command_status(args: argparse.Namespace) -> None:
     print(
         json.dumps(
             {
-                "now": format_datetime(now),
-                "fetched_at": export.get("fetched_at"),
-                "summary_count": len(export.get("items", [])),
+                "utc_now": format_datetime(now),
                 "max_receipt_date": format_datetime(newest),
-                "max_receipt_age_hours": age_hours,
+                "age_hours": age_hours,
                 "refresh_after_hours": args.refresh_after_hours,
-                "should_fetch": should_fetch,
+                "should_refresh": should_fetch,
             },
             indent=2,
         )
     )
 
 
-def command_summaries_since(args: argparse.Namespace) -> None:
-    export = load_summaries(args.data_dir)
-    since = parse_datetime(args.since) if args.since else max_summary_date(export)
-    if since is None:
-        raise SystemExit("No checkpoint date found. Run summaries first or pass --since YYYY-MM-DD.")
-    fetch_summaries_after(args, since)
+def _get_attr(html_text: str, tag_pattern: str) -> str | None:
+    """Extract an HTML attribute value from a matching tag pattern."""
+    m = re.search(tag_pattern, html_text)
+    if m:
+        return m.group(1)
+    return None
 
 
-def receipt_date(receipt: dict[str, Any]) -> datetime | None:
-    return parse_datetime(receipt.get("date"))
+def _parse_lidl_date(text: str) -> str | None:
+    """Parse a Lidl receipt date like '16/12/24' into ISO format '2024-12-16'."""
+    if not text:
+        return None
+    m = re.search(r"Date:\s*(\d{2})/(\d{2})/(\d{2})", text)
+    if m:
+        day, month, year_short = m.group(1), m.group(2), m.group(3)
+        year = "20" + year_short
+        return f"{year}-{month}-{day}"
+    return None
 
 
-def load_parsed_receipts(data_dir: Path) -> dict[str, Any]:
-    path = data_dir / "receipts_detail.json"
-    if not path.exists():
-        raise SystemExit(f"Missing {path}. Run the parse command first.")
-    return read_json(path)
+def parse_html_receipt(html_text: str) -> dict[str, Any]:
+    """Parse a Lidl UK printed receipt HTML.
 
-
-def filter_receipts(
-    receipts: list[dict[str, Any]],
-    start: datetime | None,
-    end: datetime | None,
-) -> list[dict[str, Any]]:
-    selected = []
-    for receipt in receipts:
-        dt = receipt_date(receipt)
-        if dt is None:
-            continue
-        if start is not None and dt < start:
-            continue
-        if end is not None and dt >= end:
-            continue
-        selected.append(receipt)
-    return sorted(selected, key=lambda receipt: receipt_date(receipt) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-
-
-def compact_receipt(receipt: dict[str, Any], include_articles: bool) -> dict[str, Any]:
+    The Lidl HTML uses a monospace <pre> layout with <span> elements carrying
+    the actual data in HTML attributes (data-art-description, data-unit-price,
+    data-promotion-id, etc.). This parser uses those attributes rather than
+    trying to reverse-engineer the monospace display text.
+    """
     result: dict[str, Any] = {
-        "id": receipt.get("id"),
-        "date": receipt.get("date"),
-        "store_name": receipt.get("store_name"),
-        "total_amount": receipt.get("total_amount"),
-        "article_count": receipt.get("article_count"),
-        "discount_count": receipt.get("discount_count"),
+        "articles": [],
+        "discounts": [],
+        "vat_breakdown": [],
+        "store_name": None,
+        "store_city": None,
+        "store_address": None,
+        "store_postal": None,
+        "date": None,
+        "total_displayed": None,
+        "payment_method": None,
+        "card_last4": None,
+        "articles_total": 0,
+        "discounts_total": 0,
+        "computed_net_total": 0,
+        "loyalty_points": None,
     }
-    if include_articles:
-        result["articles"] = [
-            {
-                "description": article.get("description"),
-                "quantity": article.get("quantity"),
-                "unit_price": article.get("unit_price"),
-                "line_total": article.get("line_total"),
-            }
-            for article in receipt.get("articles", [])
-        ]
-        result["discounts"] = receipt.get("discounts", [])
+
+    # --- Store info ---
+    store_m = re.search(
+        r'<span[^>]*id="header_line_1"[^>]*>(.*?)</span>',
+        html_text, re.DOTALL
+    )
+    if store_m:
+        store_text = html.unescape(store_m.group(1)).strip()
+        if store_text:
+            result["store_name"] = store_text
+
+    # --- Date from tender information ---
+    date_span = re.search(r'<span[^>]*id="purchase_tender_information_3"[^>]*>(.*?)</span>', html_text)
+    if date_span:
+        result["date"] = _parse_lidl_date(date_span.group(1))
+
+    # --- Total from purchase_summary_2 css_bold ---
+    total_re = re.search(
+        r'<span[^>]*id="purchase_summary_2"[^>]*class="[^"]*css_bold[^"]*"[^>]*>\s*([\d\.]+)\s*</span>',
+        html_text,
+    )
+    if total_re:
+        result["total_displayed"] = _parse_price(total_re.group(1))
+
+    # --- Payment method ---
+    payment_re = re.search(r'data-tender-description="([^"]*)"', html_text)
+    if payment_re:
+        result["payment_method"] = payment_re.group(1)
+
+    # --- Card last 4 digits ---
+    card_re = re.search(r'\*{3,}?(\d{4})', html_text)
+    if card_re:
+        result["card_last4"] = card_re.group(1)
+
+    # --- VAT breakdown ---
+    for vat_match in re.finditer(
+        r'data-tax-type="([^"]*)"[^>]*data-tax-percentage="([^"]*)"[^>]*'
+        r'data-tax-base-amount="([^"]*)"[^>]*data-tax-amount="([^"]*)"',
+        html_text,
+    ):
+        result["vat_breakdown"].append({
+            "type": vat_match.group(1),
+            "percentage": _parse_price(vat_match.group(2)),
+            "base_amount": _parse_price(vat_match.group(3)),
+            "amount": _parse_price(vat_match.group(4)),
+        })
+
+    # --- Articles: use data-art-* attributes ---
+    seen_article_ids: set[str] = set()
+    for art_match in re.finditer(
+        r'<span[^>]*class="article"[^>]*data-art-id="([^"]*)"[^>]*>'
+        r'(.*?)</span>',
+        html_text,
+        re.DOTALL,
+    ):
+        art_id = art_match.group(1)
+        span_html = art_match.group(0)
+
+        description = _get_attr(span_html, r'data-art-description="([^"]*)"')
+        unit_price = _get_attr(span_html, r'data-unit-price="([^"]*)"')
+        quantity = _get_attr(span_html, r'data-art-quantity="([^"]*)"')
+        tax_type = _get_attr(span_html, r'data-tax-type="([^"]*)"')
+
+        # Skip weight-continuation rows (same art id as previous, no unit-price)
+        if unit_price is None and art_id in seen_article_ids:
+            continue
+
+        seen_article_ids.add(art_id)
+
+        description_clean = html.unescape(description or "").strip()
+        # Strip trailing art id from description if present
+        if description_clean and description_clean.split()[-1] == art_id:
+            description_clean = " ".join(description_clean.split()[:-1])
+
+        # Compute total price
+        up = _parse_price(unit_price) if unit_price else None
+        qty = _parse_price(quantity) if quantity else None
+        price = None
+        if qty is not None and up is not None:
+            price = round(qty * up, 2)
+        elif up is not None:
+            price = up
+
+        result["articles"].append({
+            "name": description_clean,
+            "quantity": qty or 1,
+            "unit_price": up,
+            "price": price,
+            "tax_type": tax_type,
+            "art_id": art_id,
+        })
+
+    # --- Discounts: group by purchase_list_line number ---
+    # Each discount entry is a set of consecutive spans with the same line id.
+    # E.g. line 3 has: empty span, name span ("£5 off £35 spend"), empty spans, amount span ("-1.23")
+    discount_entries: list[dict[str, Any]] = []
+    current_line_id: str | None = None
+    current_discount: dict[str, Any] | None = None
+
+    for disc_span_match in re.finditer(
+        r'<span[^>]*class="[^"]*\bdiscount\b[^"]*"'
+        r'[^>]*>(.*?)</span>',
+        html_text,
+        re.DOTALL,
+    ):
+        span_html = disc_span_match.group(0)
+        inner = disc_span_match.group(1).strip()
+
+        line_m = re.search(r'id="purchase_list_line_([^"]*)"', span_html)
+        line_id = line_m.group(1) if line_m else None
+
+        # Line id changed -> finalize previous discount
+        if line_id != current_line_id:
+            if current_discount and (current_discount["name"] or current_discount["amount"] is not None):
+                discount_entries.append(current_discount)
+            current_discount = {"name": "", "amount": None, "line_id": line_id}
+            current_line_id = line_id
+
+        if not inner:
+            continue
+
+        inner_text = html.unescape(inner).strip()
+        if not inner_text:
+            continue
+
+        price_val = _parse_price(inner_text)
+        if price_val is not None and current_discount:
+            if current_discount["amount"] is None:
+                current_discount["amount"] = price_val
+        elif current_discount:
+            if not current_discount["name"]:
+                current_discount["name"] = inner_text
+
+    # Don't forget the last discount
+    if current_discount and (current_discount["name"] or current_discount["amount"] is not None):
+        discount_entries.append(current_discount)
+
+    result["discounts"] = [
+        {"name": d["name"], "amount": d["amount"]}
+        for d in discount_entries
+    ]
+
+    # --- Totals ---
+    result["articles_total"] = round(
+        sum(a["price"] for a in result["articles"] if a["price"] is not None), 2
+    )
+    result["discounts_total"] = round(
+        sum(d["amount"] for d in result["discounts"] if d["amount"] is not None), 2
+    )
+    articles_sum = result["articles_total"]
+    discs_sum = result["discounts_total"]
+    result["computed_net_total"] = round(articles_sum + discs_sum, 2)
+
     return result
 
 
-def command_query(args: argparse.Namespace) -> None:
-    parsed = load_parsed_receipts(args.data_dir)
-    now = datetime.now(timezone.utc)
-    start = parse_datetime(args.start) if args.start else None
-    end = parse_datetime(args.end) if args.end else None
-    if args.days is not None:
-        start = now - timedelta(days=args.days)
-    selected = filter_receipts(parsed.get("receipts", []), start, end)
+def _parse_price(text: str) -> float | None:
+    """Parse a price string.
+
+    Only parses values that look like prices: an optional minus sign followed
+    by digits with at most one decimal point. Full sentences like
+    '£5 off £35 spend' are rejected.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    # Must match a simple price pattern: optional -, digits, optional dot+digits
+    # Examples: "1.23", "-0.55", ".99", "5", "£5.99", "£5"
+    m = re.match(r'^[£€\$\u00a4]?\s*(\-?\d{1,8}(?:\.\d{1,4})?)\s*$', text)
+    if m:
+        try:
+            return round(float(m.group(1)), 2)
+        except (ValueError, TypeError):
+            return None
+
+    # Also handle price-suffix: "5.99 A" or "2 x £0.99 1.98" - extract last numeric part
+    # Only use this for strings that are clearly price-oriented (short, mostly numeric)
+    parts = re.split(r'\s{2,}', text)
+    for part in reversed(parts):
+        part = part.strip()
+        m = re.match(r'^[£€\$\u00a4]?\s*(\-?\d{1,8}(?:\.\d{1,4})?)\s*$', part)
+        if m:
+            return round(float(m.group(1)), 2)
+
+    return None
+
+
+def parse_details(args: argparse.Namespace) -> dict[str, Any]:
+    raw_dir = args.data_dir / "receipts"
+    detail_paths = sorted(raw_dir.glob("*.json"))
+    detail_paths = [p for p in detail_paths if p.name != "_manifest.json"]
+
+    if not detail_paths:
+        raise SystemExit(f"No receipt detail files found in {raw_dir}. Fetch details first.")
+
+    all_receipts: list[dict[str, Any]] = []
+    for detail_path in detail_paths:
+        try:
+            detail = read_json(detail_path)
+        except Exception as exc:
+            print_err(f"Skipping unreadable {detail_path}: {exc}")
+            continue
+
+        ticket = detail.get("ticket", {})
+        html_receipt = ticket.get("htmlPrintedReceipt") or ticket.get("htmlReceipt") or detail.get("htmlPrintedReceipt") or detail.get("htmlReceipt")
+        if not html_receipt:
+            print_err(f"No HTML receipt in {detail_path.name}, keeping raw file available.")
+            continue
+
+        parsed = parse_html_receipt(html_receipt)
+        parsed["id"] = detail_path.stem
+        all_receipts.append(parsed)
+
+    total_articles = sum(r.get("article_count", 0) or len(r.get("articles", [])) for r in all_receipts)
+    total_discounts = sum(r.get("discount_count", 0) or len(r.get("discounts", [])) for r in all_receipts)
+    total_spent = sum(r.get("computed_net_total", 0) or r.get("total_displayed", 0) or 0 for r in all_receipts)
+
+    all_receipts.sort(
+        key=lambda r: r.get("date") or "",
+        reverse=True,
+    )
+
     output = {
-        "start": format_datetime(start),
-        "end": format_datetime(end),
-        "receipt_count": len(selected),
-        "total_spent": round(sum(receipt.get("total_amount") or 0 for receipt in selected), 2),
-        "receipts": [compact_receipt(receipt, args.include_articles) for receipt in selected],
+        "parsed_at": utc_now(),
+        "total_receipts": len(all_receipts),
+        "total_articles": total_articles,
+        "total_discounts": total_discounts,
+        "total_spent": round(total_spent, 2),
+        "receipts": all_receipts,
     }
-    print(json.dumps(output, indent=2, ensure_ascii=False))
+    write_json(args.data_dir / "receipts_detail.json", output)
+    print(f"Parsed {len(all_receipts)} receipts, saved to {args.data_dir / 'receipts_detail.json'}")
+    return output
+
+
+def load_detail(args: argparse.Namespace) -> dict[str, Any]:
+    path = args.data_dir / "receipts_detail.json"
+    if not path.exists():
+        raise SystemExit(f"Missing {path}. Parse details first.")
+    return read_json(path)
+
+
+def query_receipts(args: argparse.Namespace) -> None:
+    detail = load_detail(args)
+
+    start_dt = parse_datetime(args.start) if args.start else None
+    end_dt = parse_datetime(args.end) if args.end else None
+    now_utc = datetime.now(timezone.utc)
+
+    if not start_dt and args.days is not None:
+        start_dt = now_utc - timedelta(days=args.days)
+
+    filtered = detail.get("receipts", [])
+    if start_dt or end_dt:
+        filtered = [
+            r for r in filtered
+            if _receipt_in_range(r, start_dt, end_dt)
+        ]
+
+    if not filtered:
+        print(json.dumps({"receipts": [], "count": 0}, indent=2))
+        return
+
+    output = {
+        "parsed_at": detail.get("parsed_at"),
+        "query_start": format_datetime(start_dt),
+        "query_end": format_datetime(end_dt),
+        "total_receipts": len(filtered),
+        "total_articles": sum(len(r.get("articles", [])) for r in filtered),
+        "total_discounts": sum(len(r.get("discounts", [])) for r in filtered),
+        "total_spent": round(sum(r.get("computed_net_total", 0) or r.get("total_displayed", 0) or 0 for r in filtered), 2),
+        "receipts": filtered,
+    }
+
+    if args.include_articles:
+        print(json.dumps(output, indent=2, ensure_ascii=False, default=str))
+    else:
+        condensed = {k: v for k, v in output.items() if k != "receipts"}
+        condensed["receipts"] = [
+            {
+                "id": r.get("id"),
+                "date": r.get("date"),
+                "store_name": r.get("store_name"),
+                "store_city": r.get("store_city"),
+                "total_displayed": r.get("total_displayed"),
+                "computed_net_total": r.get("computed_net_total"),
+                "articles_total": r.get("articles_total"),
+                "discounts_total": r.get("discounts_total"),
+                "payment_method": r.get("payment_method"),
+                "card_last4": r.get("card_last4"),
+                "article_count": len(r.get("articles", [])),
+                "discount_count": len(r.get("discounts", [])),
+            }
+            for r in filtered
+        ]
+        print(condensed["total_spent"])
+        print(json.dumps(condensed, indent=2, ensure_ascii=False, default=str))
+
+
+def _receipt_in_range(receipt: dict[str, Any], start: datetime | None, end: datetime | None) -> bool:
+    rdate = parse_datetime(receipt.get("date"))
+    if rdate is None:
+        return False
+    if start and rdate < start:
+        return False
+    if end and rdate >= end:
+        return False
+    return True
+
+
+def all_receipts_summary(args: argparse.Namespace) -> None:
+    summaries = load_summaries(args.data_dir)
+    total_count = summaries.get("totalCount") or len(summaries.get("items", []))
+    print(f"Total receipts in shipping address: {total_count}")
 
 
 def command_update(args: argparse.Namespace) -> None:
-    export = load_summaries(args.data_dir)
-    checkpoint = max_summary_date(export)
+    summaries = load_summaries(args.data_dir)
+    checkpoint = max_summary_date(summaries)
     if checkpoint is None:
-        raise SystemExit("No checkpoint date found. Run summaries first.")
-
-    _, new_items = fetch_summaries_after(args, checkpoint)
-    new_ids = [item["id"] for item in new_items if item.get("id")]
-    if new_ids:
-        fetch_details(args, new_ids)
-        parse_receipts(args)
-        parsed = load_parsed_receipts(args.data_dir)
-        new_id_set = set(new_ids)
-        selected = [receipt for receipt in parsed.get("receipts", []) if receipt.get("id") in new_id_set]
-        selected = sorted(
-            selected,
-            key=lambda receipt: receipt_date(receipt) or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-        output = {
-            "checkpoint": format_datetime(checkpoint),
-            "new_receipt_count": len(selected),
-            "total_spent": round(sum(receipt.get("total_amount") or 0 for receipt in selected), 2),
-            "receipts": [compact_receipt(receipt, args.include_articles) for receipt in selected],
-        }
-        print(json.dumps(output, indent=2, ensure_ascii=False))
-    else:
-        print("No new receipt summaries found.")
-
-
-def command_auth_check(args: argparse.Namespace) -> None:
-    cookie = require_cookie(args)
-    data = get_json(
-        make_headers(cookie),
-        SUMMARY_URL,
-        {"country": args.country, "page": 1},
-        RateLimiter(args.rate),
-        args.insecure,
-    )
-    items = list(data.get("items", []))
-    print(
-        json.dumps(
-            {
-                "authenticated": True,
-                "totalCount": data.get("totalCount"),
-                "page_size": data.get("size"),
-                "first_receipt_date": items[0].get("date") if items else None,
-            },
-            indent=2,
-        )
-    )
-
-
-def parse_float(value: str | None) -> float | None:
-    if value in {None, ""}:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def parse_html_receipt(receipt_html: str) -> dict[str, Any]:
-    h = html.unescape(receipt_html)
-    articles: list[dict[str, Any]] = []
-
-    article_pattern = re.compile(r'<span[^>]*class="[^"]*\barticle\b[^"]*"[^>]*>(.*?)</span>', re.DOTALL)
-    for match in article_pattern.finditer(h):
-        span_content = match.group(1)
-        full_span = match.group(0)
-        raw_visible = re.sub(r"<[^>]+>", "", span_content)
-        visible = raw_visible.strip()
-
-        if raw_visible and raw_visible[0].isspace():
-            continue
-        if visible in {"", "£"}:
-            continue
-
-        art_id = re.search(r'data-art-id="([^"]*)"', full_span)
-        desc = re.search(r'data-art-description="([^"]*)"', full_span)
-        unit_price = re.search(r'data-unit-price="([^"]*)"', full_span)
-        tax_type = re.search(r'data-tax-type="([^"]*)"', full_span)
-        quantity = re.search(r'data-art-quantity="([^"]*)"', full_span)
-        total_match = re.search(r"(-?\d+\.\d{1,2})\s*(?:[A-Z])?\s*$", visible)
-
-        articles.append(
-            {
-                "article_id": art_id.group(1) if art_id else None,
-                "description": desc.group(1) if desc else None,
-                "quantity": parse_float(quantity.group(1) if quantity else None) or 1.0,
-                "unit_price": parse_float(unit_price.group(1) if unit_price else None),
-                "line_total": parse_float(total_match.group(1) if total_match else None),
-                "tax_type": tax_type.group(1) if tax_type else None,
-            }
-        )
-
-    discounts: list[dict[str, Any]] = []
-    discount_pattern = re.compile(
-        r'<span[^>]*class="[^"]*\bdiscount\b[^"]*\bcss_bold\b[^"]*"[^>]*data-promotion-id="([^"]*)"[^>]*>'
-        r"(.*?)</span>",
-        re.DOTALL,
-    )
-    pending_labels: dict[str, str] = {}
-    for discount in discount_pattern.finditer(h):
-        promotion_id = discount.group(1)
-        text = re.sub(r"<[^>]+>", "", discount.group(2)).strip()
-        amount_text = text.replace("£", "")
-        if re.fullmatch(r"-?\d+\.\d{1,2}", amount_text):
-            discounts.append(
-                {
-                    "promotion_id": promotion_id,
-                    "label": pending_labels.get(promotion_id),
-                    "amount": float(amount_text),
-                }
-            )
-        elif text:
-            pending_labels[promotion_id] = text
-
-    article_total = sum(a["line_total"] for a in articles if a["line_total"] is not None)
-    discount_total = sum(d["amount"] for d in discounts if d["amount"] is not None)
-    computed_total = round(article_total + discount_total, 2)
-    summary_start = h.find("purchase_summary")
-    summary_end = h.find("purchase_tender_information")
-    summary_section = h[summary_start:summary_end] if summary_start != -1 and summary_end != -1 else h
-    html_total_match = re.search(r"TOTAL.*?(\d+\.\d{1,2})", summary_section, re.DOTALL)
-    html_total = parse_float(html_total_match.group(1) if html_total_match else None)
-    total_amount = computed_total if html_total is None or abs(computed_total - html_total) <= 0.10 else html_total
-
-    tender_match = re.search(r'data-tender-description="([^"]*)"', h)
-    card_match = re.search(r"\*{6,}(\d{4})", h)
-    vat_items = []
-    for vat in re.finditer(
-        r'data-tax-type="([^"]*)"[^>]*data-tax-percentage="([^"]*)"[^>]*'
-        r'data-tax-base-amount="([^"]*)"[^>]*data-tax-amount="([^"]*)"',
-        h,
-    ):
-        vat_items.append(
-            {
-                "tax_type": vat.group(1),
-                "percentage": float(vat.group(2)),
-                "base_amount": float(vat.group(3)),
-                "tax_amount": float(vat.group(4)),
-            }
-        )
-
-    return {
-        "articles": articles,
-        "discounts": discounts,
-        "total_amount": total_amount,
-        "payment_method": tender_match.group(1) if tender_match else None,
-        "card_last4": card_match.group(1) if card_match else None,
-        "vat_breakdown": vat_items,
-        "article_count": len(articles),
-        "discount_count": len(discounts),
-    }
-
-
-def parse_receipts(args: argparse.Namespace) -> None:
-    export = load_summaries(args.data_dir)
-    meta_lookup = {item["id"]: item for item in export.get("items", []) if item.get("id")}
-    raw_files = sorted(
-        Path(path)
-        for path in glob.glob(str(args.data_dir / "receipts" / "*.json"))
-        if not path.endswith("_manifest.json")
-    )
-    parsed = []
-    errors = []
-
-    for raw_file in raw_files:
-        receipt_id = raw_file.stem
-        meta = meta_lookup.get(receipt_id, {})
-        try:
-            data = read_json(raw_file)
-            ticket = data.get("ticket") or data
-            receipt_html = ticket.get("htmlPrintedReceipt") or ticket.get("htmlReceipt") or ""
-            store = ticket.get("store") or data.get("store") or {}
-            if not receipt_html:
-                errors.append({"id": receipt_id, "error": "no htmlPrintedReceipt"})
-                continue
-            result = parse_html_receipt(receipt_html)
-            parsed.append(
-                {
-                    "id": receipt_id,
-                    "date": ticket.get("date") or data.get("date") or meta.get("date"),
-                    "store_name": store.get("name") or meta.get("store"),
-                    "store_address": store.get("address"),
-                    "store_postcode": store.get("postalCode"),
-                    "locality": store.get("locality"),
-                    "total_amount": result["total_amount"] if result["total_amount"] is not None else ticket.get("totalAmount") or meta.get("totalAmount"),
-                    "payment_method": result["payment_method"],
-                    "card_last4": result["card_last4"],
-                    "vat_breakdown": result["vat_breakdown"],
-                    "loyalty_points": (data.get("collectingModel") or {}).get("points", 0),
-                    "articles": result["articles"],
-                    "discounts": result["discounts"],
-                    "article_count": result["article_count"],
-                    "discount_count": result["discount_count"],
-                }
-            )
-        except Exception as exc:  # noqa: BLE001 - keep parsing remaining files
-            errors.append({"id": receipt_id, "error": f"{type(exc).__name__}: {exc}"})
-
-    total_articles = sum(r["article_count"] for r in parsed)
-    total_discounts = sum(r["discount_count"] for r in parsed)
-    total_spent = round(sum(r["total_amount"] or 0 for r in parsed), 2)
-    output = {
-        "parsed_at": utc_now(),
-        "total_receipts": len(parsed),
-        "total_articles": total_articles,
-        "total_discounts": total_discounts,
-        "total_spent": total_spent,
-        "receipts": parsed,
-    }
-    write_json(args.data_dir / "receipts_detail.json", output)
-    print(f"Parsed {len(parsed)} receipts to {args.data_dir / 'receipts_detail.json'}")
-    print(f"Total articles: {total_articles}, discounts: {total_discounts}, spent: GBP {total_spent:.2f}")
-    if errors:
-        print("First parse errors:")
-        for error in errors[:5]:
-            print(f"  {error['id']}: {error['error']}")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fetch and parse Lidl UK digital receipts.")
-    parser.add_argument(
-        "command",
-        choices=["auth-check", "summaries", "summaries-since", "details", "parse", "all", "update", "status", "query"],
-    )
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--country", default="GB")
-    parser.add_argument("--language-code", default="en-GB")
-    parser.add_argument("--cookie", help="Full Lidl Cookie header. Prefer LIDL_COOKIE instead.")
-    parser.add_argument("--cookie-stdin", action="store_true", help="Read the full Lidl Cookie header from stdin.")
-    parser.add_argument("--login", action="store_true", help="Use Playwright to log in with Lidl credentials.")
-    parser.add_argument("--email", help="Lidl login email. Prefer LIDL_EMAIL or LIDL_USER for agent runs.")
-    parser.add_argument("--password-stdin", action="store_true", help="Read the Lidl password from the first stdin line.")
-    parser.add_argument(
-        "--auth-state",
-        type=Path,
-        help="Playwright storage-state path. Defaults to data/lidl_auth_state.json when --login is used.",
-    )
-    parser.add_argument("--no-auth-state", action="store_true", help="Do not read or write browser auth state.")
-    parser.add_argument("--auth-headed", action="store_true", help="Show the browser during credential login.")
-    parser.add_argument(
-        "--auth-interactive",
-        action="store_true",
-        help="Open a browser and wait for the user to complete Lidl login manually, then save auth state.",
-    )
-    parser.add_argument(
-        "--auth-browser-channel",
-        help="Optional Playwright browser channel for login, for example chrome.",
-    )
-    parser.add_argument("--auth-timeout", type=int, default=90, help="Browser login timeout in seconds.")
-    parser.add_argument("--rate", type=float, default=3.0, help="Maximum API requests per second.")
-    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
-    parser.add_argument("--since", help="Checkpoint date for summaries-since, for example 2026-05-07.")
-    parser.add_argument("--refresh-after-hours", type=float, default=6.0)
-    parser.add_argument("--start", help="Inclusive query start date/datetime, for example 2026-05-07.")
-    parser.add_argument("--end", help="Exclusive query end date/datetime, for example 2026-05-08.")
-    parser.add_argument("--days", type=float, help="Query receipts from the last N days.")
-    parser.add_argument("--include-articles", action="store_true", help="Include article and discount lines in query output.")
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    args.data_dir = args.data_dir.expanduser().resolve()
-
-    if args.command in {"summaries", "all"}:
+        print("No existing receipts found; running full export.")
         fetch_summaries(args)
-    if args.command == "summaries-since":
-        command_summaries_since(args)
-    if args.command in {"details", "all"}:
         fetch_details(args)
-    if args.command in {"parse", "all"}:
-        parse_receipts(args)
-    if args.command == "update":
-        command_update(args)
-    if args.command == "auth-check":
-        command_auth_check(args)
-    if args.command == "status":
+        parse_details(args)
+        return
+
+    print(f"Checkpoint date: {format_datetime(checkpoint)}")
+    merged_export, new_items = fetch_summaries_after(args, checkpoint)
+    new_ids = [item["id"] for item in new_items if item.get("id")]
+    if not new_ids:
+        print("No new receipts since last update.")
+        return
+
+    print(f"Fetching details for {len(new_ids)} new receipt(s)...")
+    fetch_details(args, new_ids)
+    parse_details(args)
+    detail = load_detail(args)
+    new_receipts = [r for r in detail.get("receipts", []) if r.get("id") in new_ids]
+    if args.include_articles and new_receipts:
+        print("\n=== New Receipts ===")
+        print(json.dumps(new_receipts, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(f"Updated: {len(new_ids)} new receipt(s) fetched and parsed.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch and parse Lidl UK digital receipts.")
+
+    parser.add_argument("--data-dir", type=Path, default=Path("data"), help="Output directory (default: data)")
+    parser.add_argument("--country", default="GB", help="Country code (default: GB)")
+    parser.add_argument("--language-code", default="en-GB", help="Language code (default: en-GB)")
+    parser.add_argument("--cookie", help="Full Lidl Cookie header value")
+    parser.add_argument("--cookie-stdin", action="store_true", help="Read Lidl Cookie header from stdin")
+    parser.add_argument("--login", action="store_true", help="Derive cookie with Playwright browser auth")
+    parser.add_argument("--email", help="Lidl login email")
+    parser.add_argument("--password-stdin", action="store_true", help="Read Lidl password from stdin")
+    parser.add_argument("--auth-state", type=Path, help="Custom Playwright storage-state path")
+    parser.add_argument("--no-auth-state", action="store_true", help="Do not read or write browser auth state")
+    parser.add_argument("--auth-headed", action="store_true", help="Show the auth browser")
+    parser.add_argument("--auth-interactive", action="store_true", help="Open browser and wait for manual login")
+    parser.add_argument("--auth-browser-channel", help="Playwright browser channel (e.g., chrome)")
+    parser.add_argument("--auth-timeout", type=int, default=120, help="Auth login timeout in seconds (default: 120)")
+    parser.add_argument("--rate", type=float, default=3.0, help="Max API requests per second (default: 3)")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
+    parser.add_argument("--refresh-after-hours", type=float, default=6.0, help="Age threshold for status command (default: 6)")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # all
+    subparsers.add_parser("all", help="Fetch summaries, details, and parse all receipts")
+
+    # status
+    status_parser = subparsers.add_parser("status", help="Show last fetch status and whether refresh is needed")
+    status_parser.add_argument("--refresh-after-hours", type=float, default=6.0)
+
+    # summaries
+    subparsers.add_parser("summaries", help="Fetch receipt summaries from Lidl API")
+
+    # summaries-since
+    summaries_since = subparsers.add_parser("summaries-since", help="Fetch summary pages newer than local checkpoint")
+    summaries_since.add_argument("--since", help="ISO datetime checkpoint (default: from existing file)")
+
+    # details
+    details_parser = subparsers.add_parser("details", help="Fetch detail JSON for all summary receipts")
+    details_parser.add_argument("--ids", nargs="*", help="Specific receipt IDs to fetch")
+
+    # parse
+    parse_parser = subparsers.add_parser("parse", help="Parse saved raw receipts into structured JSON")
+
+    # query
+    query_parser = subparsers.add_parser("query", help="Query parsed receipt data")
+    query_parser.add_argument("--start", help="Inclusive start date (ISO format)")
+    query_parser.add_argument("--end", help="Exclusive end date (ISO format)")
+    query_parser.add_argument("--days", type=int, help="Receipts from last N days")
+    query_parser.add_argument("--include-articles", action="store_true", help="Include full article and discount details")
+
+    # update
+    update_parser = subparsers.add_parser("update", help="Fetch only new receipts since last check")
+    update_parser.add_argument("--include-articles", action="store_true", help="Print full article details for new receipts")
+
+    args = parser.parse_args()
+
+    if args.command == "all":
+        fetch_summaries(args)
+        fetch_details(args)
+        parse_details(args)
+    elif args.command == "status":
         command_status(args)
-    if args.command == "query":
-        command_query(args)
-    return 0
+    elif args.command == "summaries":
+        fetch_summaries(args)
+    elif args.command == "summaries-since":
+        if args.since:
+            since = parse_datetime(args.since)
+            if since is None:
+                raise SystemExit(f"Invalid --since date: {args.since}")
+            fetch_summaries_after(args, since)
+        else:
+            summaries = load_summaries(args.data_dir)
+            checkpoint = max_summary_date(summaries)
+            if checkpoint is None:
+                raise SystemExit("No receipts found in existing data. Provide --since or run summaries first.")
+            fetch_summaries_after(args, checkpoint)
+    elif args.command == "details":
+        fetch_details(args, args.ids)
+    elif args.command == "parse":
+        parse_details(args)
+    elif args.command == "query":
+        query_receipts(args)
+    elif args.command == "update":
+        command_update(args)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

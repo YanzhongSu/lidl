@@ -15,6 +15,10 @@ Use this skill to export a user's Lidl UK receipt history into deterministic loc
 
 Use the authentication method that fits the runtime. If the agent is definitely running on a machine with an interactive browser UI, Playwright browser auth state can avoid repeated cookie pasting. If the agent has access to the user's already logged-in Chrome session through Playwright MCP / computer-use, the fastest path is often to call the Lidl receipt API from that logged-in page context and then save only aggregate/raw receipt JSON locally. If the agent is running on a VM, container, remote worker, CI job, or any environment without browser UI, copied-cookie mode is the correct path. Do not hardcode or commit credentials, cookies, tokens, or auth state.
 
+## Scope
+
+This skill is only for Lidl receipt export/parsing/querying. Do not conflate it with unrelated business metrics, email, FT/news, WhatsApp, or other app workflows just because they happened in the same session. If the user switches topics, load/use the skill for that new class of work instead.
+
 ## Workflow
 
 For local analysis questions, use existing JSON files first. Only authenticate when an API refresh is needed.
@@ -22,8 +26,19 @@ For local analysis questions, use existing JSON files first. Only authenticate w
 Common fast paths:
 
 - "What did I buy yesterday / in the past few days?" Run `query` against `./data/receipts_detail.json`; do not call the Lidl API unless the user asks for a refresh or the requested date range may not be present locally.
-- "Have I bought anything since last time we checked?" or "Show me what I bought since last time we checked" Run `update` with the appropriate auth option once. It loads `./data/receipts_summaries.json`, finds the max date among `items`, fetches summary pages only until that checkpoint date is covered, fetches details only for new receipt ids, parses, prints the new receipts, then stops.
+- "Have I bought anything since last time we checked?" Run `update` with the appropriate auth option once. It loads `./data/receipts_summaries.json`, finds the max date among `items`, fetches summary pages only until that checkpoint date is covered, fetches details only for new receipt ids, parses, prints the new receipts, then stops.
 - "Should I refresh?" Run `status`. It prints current UTC time, max receipt date, and whether the max receipt date is older than `--refresh-after-hours` (default `6`).
+
+### Fallback when refresh/auth is unavailable
+
+For "since last time" questions, attempt one refresh path when appropriate, but if authentication is unavailable and the user does not provide a cookie/login within the current turn, still answer from the cached export instead of stopping with only an auth problem. Use `status` to identify both `fetched_at` and `max_receipt_date`, then query the cached range after the checkpoint if useful. Report clearly:
+
+- last successful export time (`fetched_at`),
+- latest cached receipt date (`max_receipt_date`),
+- cached spend/receipt count since that checkpoint,
+- and that live purchases after `fetched_at` are unverified until Lidl auth is refreshed.
+
+Do not imply there were no real-world purchases after the cached export; say only that none are present in the local cached data.
 
 Authentication decision (priority order):
 
@@ -54,56 +69,49 @@ Full export workflow:
 6. Fetch detail JSON next. Existing `./data/receipts/{id}.json` files are skipped, so interrupted runs resume.
 7. Parse the saved raw details into `./data/receipts_detail.json`.
 
-Authentication notes
-
-- Lidl UK uses an OpenID Connect authorization-code flow with PKCE through `accounts.lidl.com`.
-- Successful login redirects back to `www.lidl.co.uk/user-api/signin-oidc`, which sets first-party cookies used by `/mre/api/v1/tickets`.
-- Relevant post-login receipt cookies include `ldi-user-context`, `authToken`, `ldi-session-info`, `ldi-customertoken`, `tracking-info`, and `customer-info`.
-- **The best path for automated refresh**: use Playwright MCP to navigate to `/mla/` in the user's already-logged-in Chrome, then run `fetch(...)` from that page context with `credentials: 'include'`. No reCAPTCHA, no credential handling, no temp browser profile. The user's existing Lidl session cookies are automatically included.
-- For agent credentials in standalone runs, the script supports `LIDL_USER`/`LIDL_EMAIL` for email and `LIDL_PW`/`LIDL_PASSWORD` for password (set in `~/.hermes/.env`). These are used by `resolve_login_credentials()`.
-
 ## Commands
 
 Use `scripts/lidl_receipts.py`:
 
+⚠️ **Argparse order matters**: `--cookie-stdin`, `--login`, and other global flags must come BEFORE the subcommand (e.g. `--cookie-stdin all`, not `all --cookie-stdin`). The script uses argparse subparsers — global options on the main parser won't be recognised after the subcommand name.
+
 VM/headless or remote-agent mode:
 
 ```bash
-python3 scripts/lidl_receipts.py all --cookie-stdin
+python3 scripts/lidl_receipts.py --cookie-stdin all
 ```
 
 Local interactive-browser mode:
 
 ```bash
-python3 scripts/lidl_receipts.py auth-check --login --auth-interactive --auth-browser-channel chrome
-python3 scripts/lidl_receipts.py all --login
+# Current helper versions may not expose an auth-check subcommand.
+# If an existing browser/auth state is valid, update directly:
+python3 scripts/lidl_receipts.py --login --auth-browser-channel chrome update --include-articles
+
+# If interactive auth is required, run the desired API command with interactive login flags
+# and ask the user to complete the login in the opened browser:
+python3 scripts/lidl_receipts.py --login --auth-interactive --auth-browser-channel chrome update --include-articles
 ```
 
 Useful subcommands:
 
 ```bash
-python3 scripts/lidl_receipts.py auth-check [AUTH_OPTION]
-python3 scripts/lidl_receipts.py summaries [AUTH_OPTION]
-python3 scripts/lidl_receipts.py update [AUTH_OPTION] --include-articles
-python3 scripts/lidl_receipts.py summaries-since [AUTH_OPTION]
-python3 scripts/lidl_receipts.py details [AUTH_OPTION]
+python3 scripts/lidl_receipts.py [AUTH_OPTION] auth-check
+python3 scripts/lidl_receipts.py [AUTH_OPTION] summaries
+python3 scripts/lidl_receipts.py [AUTH_OPTION] update --include-articles
+python3 scripts/lidl_receipts.py [AUTH_OPTION] summaries-since
+python3 scripts/lidl_receipts.py [AUTH_OPTION] details
 python3 scripts/lidl_receipts.py parse
 python3 scripts/lidl_receipts.py status
-python3 scripts/lidl_receipts.py query --start 2026-05-07 --end 2026-05-08 --include-articles
+python3 scripts/lidl_receipts.py query --start 2026-05-09 --end 2026-05-10 --include-articles
 python3 scripts/lidl_receipts.py query --days 3 --include-articles
 ```
 
 Use `[AUTH_OPTION]` as one of:
 
-- `--cookie-stdin` when the user supplies the full Cookie header through stdin.
+- `--cookie-stdin` when the user supplies the full Cookie header through stdin (reads a single line).
 - no explicit option when `LIDL_COOKIE` is set in the environment.
 - `--login` only on a machine with interactive browser UI or an existing valid `./data/lidl_auth_state.json`.
-
-When an agent already has the cookie in conversation context, prefer stdin to avoid putting the cookie on the process command line:
-
-```bash
-python3 scripts/lidl_receipts.py all --cookie-stdin
-```
 
 Default options:
 
@@ -115,8 +123,6 @@ Default options:
 - Detail endpoint: `https://www.lidl.co.uk/mre/api/v1/tickets/{id}?country=GB&languageCode=en-GB`
 
 Use `--data-dir`, `--country`, `--language-code`, or `--rate` only when the user asks or local context requires it.
-
-Use `--insecure` only when the local Python TLS trust store rejects the connection with a certificate-chain error in a controlled environment.
 
 ## Browser-session API fallback (PREFERRED PATH)
 
@@ -164,7 +170,7 @@ async () => {
     const r = await fetch(`https://www.lidl.co.uk/mre/api/v1/tickets/${s.id}?country=GB&languageCode=en-GB`, {credentials: 'include'});
     details[s.id] = await r.json();
   }
-  return {fetched_at: new Date().toISOString().replace(/\\.\\d{3}Z$/, 'Z'), summariesPayload, newSummaries, details};
+  return {fetched_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'), summariesPayload, newSummaries, details};
 }
 ```
 
@@ -191,7 +197,7 @@ If you only need to know whether a refresh is likely needed:
 python3 scripts/lidl_receipts.py status
 ```
 
-For date-range questions, calculate explicit date boundaries and use `query`. `--start` is inclusive and `--end` is exclusive:
+For date-range questions, calculate explicit date boundaries. `--start` is inclusive and `--end` is exclusive:
 
 ```bash
 python3 scripts/lidl_receipts.py query --start 2026-05-09 --end 2026-05-10 --include-articles
@@ -199,23 +205,64 @@ python3 scripts/lidl_receipts.py query --start 2026-05-09 --end 2026-05-10 --inc
 
 ## Output Contract
 
-The parsed output should contain:
+Parsed output contains `receipts[]` entries with: `id`, `date`, `store_name`, `total_displayed`, `articles_total`, `discounts_total`, `computed_net_total`, `payment_method`, `card_last4`, `vat_breakdown`, `article_count`, `discount_count`, `articles[]`, and `discounts[]`.
 
-- `parsed_at`, `total_receipts`, `total_articles`, `total_discounts`, `total_spent`
-- `receipts[]` entries with `id`, `date`, store fields, `total_amount`, `payment_method`, `card_last4`, `vat_breakdown`, `loyalty_points`, `articles`, `discounts`, `article_count`, and `discount_count`
+### Computed vs displayed totals
 
-Parsing notes:
+Prefer the **displayed total** (`total_displayed`) from the HTML over the computed total (`computed_net_total`), because multi-buy proration can cause articles-sum-plus-discounts to slightly overstate the actual charge. The displayed total matches what was actually paid. Use `computed_net_total` as a sanity check — should be within ~10% of displayed total.
 
-- Parse article rows from `<span class="article">` elements and skip weight continuation rows whose visible text starts with whitespace.
-- Parse discounts sequentially from `<span class="discount css_bold">` rows instead of grouping only by promotion id.
-- Prefer computed totals from article line totals plus discounts when close to the displayed total, because some Lidl HTML total spans truncate.
-- Extract payment method from `data-tender-description` and card last 4 from masked card patterns such as `***********0615`.
-- Extract VAT from `data-tax-type`, `data-tax-percentage`, `data-tax-base-amount`, and `data-tax-amount`.
+## HTML Parsing reference
+
+See `references/api-response-format.md` for the full API response structure.
+
+Key patterns for the Lidl UK receipt HTML:
+
+- **Store name**: `<span id="header_line_1">Shepherds Bush</span>` — inner text. Fall back to `ticket.store.name` from the API response.
+- **Date**: `<span id="purchase_tender_information_3">Date: 23/07/25 Time: 20:48:14</span>` in DD/MM/YY. Normalise to ISO.
+- **Total**: `<span id="purchase_summary_2" class="css_bold">28.73</span>` — first css_bold in purchase_summary.
+- **Payment**: `data-tender-description="CARD"` attribute on purchase_summary_3 span.
+- **Card last 4**: Masked pattern `***********0615`.
+- **Articles**: `<span class="article" data-art-id="..." data-unit-price="..." data-art-description="...">`. Always use `data-art-*` attributes, not display text. Skip weight-continuation rows (same data-art-id, no data-unit-price).
+- **Discounts**: Spans with `class="discount"`. Group by `purchase_list_line_N` id (NOT by `data-promotion-id`, which repeats across line items). Each group has one name span and one amount span.
+- **VAT**: `<span id="vat_info_line_2" data-tax-type="..." data-tax-percentage="..." data-tax-base-amount="..." data-tax-amount="...">`.
+
+### Price parsing pitfalls
+
+Never use "strip all non-digit characters" to parse prices. Discount name text like "£5 off £35 spend" would become `535`. Use a strict regex: optional currency prefix, optional minus, digits, optional dot+digits — reject anything with letters.
 
 ## Failure Handling
 
 - If an API call returns `401` or `403`, refresh the chosen auth method. On VM/headless runs, ask for a fresh copied Cookie header. On local interactive-browser runs, rerun `auth-check --login --auth-interactive`.
-- If using the browser-session API fallback, ensure the account page is actually logged in first, call summary `page=1` not `page=0`, and fetch details from the same page context with `credentials: 'include'`.
+- Lidl uses **Google reCAPTCHA Enterprise** (invisible v3) and **FingerprintJS** on the login page. Automated credential login without `--auth-interactive` will almost certainly be rejected by reCAPTCHA — this is expected. Use `--auth-interactive` once to complete login manually, or use the browser-session API fallback for automated refreshes.
+- **Corrupted auth state file**: If `lidl_auth_state.json` is 1MB+ or contains cookies from dozens of unrelated sites (e.g. copied from a general browser cookie dump), Playwright fails to load it and crashes with `TargetClosedError: Target page, context or browser has been closed` on `page.goto()`. Fix: pass `--no-auth-state` to skip the corrupted file and force a fresh headed login.
+- For agent credentials, the script supports `LIDL_USER`/`LIDL_EMAIL` for email and `LIDL_PW`/`LIDL_PASSWORD` for password (set in `~/.hermes/.env`).
+- If `--login ... update` fails before opening a browser with `Missing Lidl email. Provide --email or set LIDL_EMAIL`, do not stop or ask for credentials if Playwright MCP can access the user's logged-in Chrome session. Treat it as a signal to switch to the browser-session API fallback: verify the `/mla/` page shows the account greeting, then fetch summaries/details via page-context `fetch(..., {credentials: 'include'})`.
+- If using the browser-session API fallback, ensure the account page is actually logged in first, call summary `page=1` not `page=0`, and fetch details from the same page context with `credentials: 'include'`. Save the browser evaluation result to a local JSON file only if needed for merging; never include cookies/tokens in that file or final answer.
+- After browser-session fallback fetching, merge new summaries by id, write each detail under `data/receipts/{id}.json`, run `parse`, then run `status` and a query/filter for the checkpoint range to verify receipt count and total spend before reporting.
 - If detail fetching stops partway through, rerun `details` or `all`; existing receipt files are skipped.
-- If parsing reports missing HTML receipts, keep the raw JSON files and summarize the affected receipt ids.
+- If parsing reports missing HTML receipts, check both `ticket.htmlPrintedReceipt` / `ticket.htmlReceipt` and top-level `htmlPrintedReceipt` / `htmlReceipt` before concluding the detail is missing. Current Lidl API responses commonly nest receipt HTML under `ticket`.
+- If copied-cookie commands error with `unrecognized arguments: --cookie-stdin`, move global options before the subcommand (for example `python3 scripts/lidl_receipts.py --cookie-stdin all`).
 - Keep credentials, cookies, tokens, and auth state out of commits and final answers.
+
+## Maintenance and upstream sync
+
+When you change the installed helper script or parser behavior during a task, do not leave the skill copy and upstream repo diverged. Sync fixes back to the source repo (`YanzhongSu/lidl`) when the user asks or when the fix is clearly reusable:
+
+```bash
+# use the user's SSH GitHub workflow
+cd /tmp/lidl  # or clone git@github.com:YanzhongSu/lidl.git
+make smoke
+python3 scripts/lidl_receipts.py parse --data-dir /Users/yanzhongsu/data
+python3 scripts/lidl_receipts.py query --data-dir /Users/yanzhongsu/data --days 7
+git add Makefile scripts/lidl_receipts.py tests/
+git commit -m "fix: support nested Lidl receipt responses"
+git remote set-url origin git@github.com:YanzhongSu/lidl.git
+git push origin main
+```
+
+Use `make smoke` plus a parse/query against real cached receipts as verification. Regression tests should cover nested `ticket.htmlPrintedReceipt`, top-level legacy receipt shapes, discount labels such as `£5 off £35 spend`, weighted-product continuation rows, and displayed-vs-computed total reconciliation.
+
+## Reference Notes
+
+- `references/parser-and-cli-gotchas.md` captures verified parser pitfalls from real Lidl UK receipt data: nested `ticket` responses, discount labels such as `£5 off £35 spend`, weighted-product continuation rows, total reconciliation, and CLI option ordering.
+- `references/lidl-anti-bot-analysis.md` documents the reCAPTCHA Enterprise v3, FingerprintJS, and behavioral worker found on `accounts.lidl.com`, plus the `--no-auth-state` workaround for corrupted auth state files.
