@@ -25,33 +25,41 @@ Common fast paths:
 - "Have I bought anything since last time we checked?" or "Show me what I bought since last time we checked" Run `update` with the appropriate auth option once. It loads `./data/receipts_summaries.json`, finds the max date among `items`, fetches summary pages only until that checkpoint date is covered, fetches details only for new receipt ids, parses, prints the new receipts, then stops.
 - "Should I refresh?" Run `status`. It prints current UTC time, max receipt date, and whether the max receipt date is older than `--refresh-after-hours` (default `6`).
 
-Authentication decision:
+Authentication decision (priority order):
 
-- If the command does not need Lidl API access, do not authenticate.
-- If a valid copied cookie is already available in context, use `--cookie-stdin` or `LIDL_COOKIE`.
-- If the agent is on a VM/headless/remote environment without browser UI, ask the user for the full `Cookie` request header from a logged-in Lidl browser request and use `--cookie-stdin` or `LIDL_COOKIE`.
-- If the agent can access the user's already logged-in Chrome session and the page is authenticated (`/mla/` shows the account page), use the browser-session API fallback below before asking for cookies or passwords.
-- If, and only if, the agent is definitely on a local machine with interactive browser UI, use `--login` to reuse `./data/lidl_auth_state.json`. If that state is missing or expired, use `auth-check --login --auth-interactive` and ask the user to complete the login in the opened browser.
-- Automated credential login (`--login`) can attempt to log in without user interaction if `LIDL_USER`/`LIDL_EMAIL` and `LIDL_PW`/`LIDL_PASSWORD` are set in the environment. The script launches headed Chrome (not headless) with anti-bot mitigations: `navigator.webdriver` hidden, `press_sequentially()` for human-like typing, realistic viewport/user-agent, and random delays between actions. Lidl's anti-bot may still reject automated login — fall back to `--auth-interactive` or the browser-session API fallback if it fails.
+**1. Playwright MCP / browser-session (PREFERRED)** — If Playwright MCP is connected to the user's running Chrome session:
+   a. Navigate to `https://www.lidl.co.uk/mla/` via Playwright MCP
+   b. Check the page shows the account greeting (already logged in — user keeps Lidl logged in day-to-day)
+   c. If logged in: use `fetch(...)` from the page context with `credentials: 'include'` to call the Lidl receipt API. This reuses the user's real browser session — no separate login needed, no reCAPTCHA, no temp profiles.
+   d. If not logged in: fall through to option 2.
+
+**2. Copied cookie** — If the user has a Lidl session open in their browser and can copy the `Cookie` header from a receipt API request, use `--cookie-stdin` or `LIDL_COOKIE` env var. This is the right path for VM/headless/remote agent environments with no browser UI.
+
+**3. Interactive Playwright login (`--login --auth-interactive`)** — On a machine with a display, use `--login --auth-interactive` which opens a headed Chrome window for the user to complete Lidl login manually. After success, saves `lidl_auth_state.json` for reuse on subsequent runs until cookies expire.
+
+**4. Automated credential login (`--login` without `--auth-interactive`)** — Attempts fully automated login using `LIDL_USER`/`LIDL_EMAIL` and `LIDL_PW`/`LIDL_PASSWORD` from the environment. The script launches headed real Chrome with anti-bot mitigations: `navigator.webdriver` hidden, `press_sequentially()` for human-like typing, realistic viewport/user-agent, and random delays. **However, Lidl uses reCAPTCHA Enterprise + FingerprintJS** on the login page, so automated login will almost certainly be rejected. This is expected and not a bug. If it fails, fall back to option 3 or 1.
+
+**5. No auth / cached data only** — If none of the above are available, answer from `./data/receipts_detail.json` and clearly report the last fetch time.
+
+⚠️ **Corrupted auth state file**: If `lidl_auth_state.json` is 1MB+ or was dumped from a general browser cookie store (contains cookies from dozens of unrelated sites), Playwright crashes with `TargetClosedError` when trying to load it. Fix: pass `--no-auth-state` to skip the corrupted file, or delete it to regenerate a clean one via `--login --auth-interactive`.
 
 Full export workflow:
 
-1. Choose the auth option using the authentication decision above.
-2. For VM/headless runs, get a fresh full `Cookie` request header from the user and pass it via `--cookie-stdin` or `LIDL_COOKIE`.
-3. For local interactive-browser runs, bootstrap or reuse `./data/lidl_auth_state.json` with `--login`.
-4. Fetch summaries first. The script reads `totalCount` and page `size` to request every summary page.
-5. Fetch detail JSON next. The script skips existing `./data/receipts/{id}.json` files, so interrupted runs can resume.
-6. Parse the saved raw details into `./data/receipts_detail.json`.
+1. Choose the auth method using the priority order above.
+2. For Playwright MCP path: use the browser-session API fallback (detailed below).
+3. For VM/headless runs: get a fresh full `Cookie` header from the user and pass via `--cookie-stdin` or `LIDL_COOKIE`.
+4. For local interactive-browser runs: use `--login --auth-interactive` once, then `--login` reuses the saved state.
+5. Fetch summaries first. The script reads `totalCount` and page `size` to request every summary page.
+6. Fetch detail JSON next. Existing `./data/receipts/{id}.json` files are skipped, so interrupted runs resume.
+7. Parse the saved raw details into `./data/receipts_detail.json`.
 
-Authentication notes:
+Authentication notes
 
 - Lidl UK uses an OpenID Connect authorization-code flow with PKCE through `accounts.lidl.com`.
 - Successful login redirects back to `www.lidl.co.uk/user-api/signin-oidc`, which sets first-party cookies used by `/mre/api/v1/tickets`.
 - Relevant post-login receipt cookies include `ldi-user-context`, `authToken`, `ldi-session-info`, `ldi-customertoken`, `tracking-info`, and `customer-info`.
-- Lidl uses **Google reCAPTCHA Enterprise** (invisible v3) and **FingerprintJS** on the login page. This means automated credential login (`--login` without `--auth-interactive`) will almost certainly be rejected — reCAPTCHA scores Playwright-driven sessions as bot-like regardless of anti-detection mitigations. This is expected and not a bug.
-- For agent credentials, the script supports `LIDL_USER`/`LIDL_EMAIL` for email and `LIDL_PW`/`LIDL_PASSWORD` for password (set in `~/.hermes/.env`). These are used by `resolve_login_credentials()`.
-- **If automated login fails** (expected): use `--auth-interactive` once to complete the login manually in the opened browser. The saved auth state (`lidl_auth_state.json`) will be reused on subsequent `--login` runs until it expires.
-- **Best path for automated refresh**: use the browser-session API fallback (Playwright MCP access to already-logged-in Chrome) — navigate to `/mla/`, verify logged-in state, then use `fetch(...)` from the page context with `credentials: 'include'`.
+- **The best path for automated refresh**: use Playwright MCP to navigate to `/mla/` in the user's already-logged-in Chrome, then run `fetch(...)` from that page context with `credentials: 'include'`. No reCAPTCHA, no credential handling, no temp browser profile. The user's existing Lidl session cookies are automatically included.
+- For agent credentials in standalone runs, the script supports `LIDL_USER`/`LIDL_EMAIL` for email and `LIDL_PW`/`LIDL_PASSWORD` for password (set in `~/.hermes/.env`). These are used by `resolve_login_credentials()`.
 
 ## Commands
 
