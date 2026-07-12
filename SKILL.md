@@ -27,11 +27,12 @@ Common fast paths:
 
 Authentication decision (priority order):
 
-**1. Playwright MCP / browser-session (PREFERRED)** — If Playwright MCP is connected to the user's running Chrome session:
+**1. Playwright MCP / browser-session (PREFERRED)** — Use the connected Playwright MCP to access the user's real Chrome session:
    a. Navigate to `https://www.lidl.co.uk/mla/` via Playwright MCP
-   b. Check the page shows the account greeting (already logged in — user keeps Lidl logged in day-to-day)
-   c. If logged in: use `fetch(...)` from the page context with `credentials: 'include'` to call the Lidl receipt API. This reuses the user's real browser session — no separate login needed, no reCAPTCHA, no temp profiles.
-   d. If not logged in: fall through to option 2.
+   b. Check if already logged in (page shows account greeting)
+   c. **If logged in**: use `fetch(...)` from the page context with `credentials: 'include'` to call the Lidl receipt API. No separate login needed, no reCAPTCHA.
+   d. **If not logged in**: login via Playwright MCP using browser_find/browser_type/browser_click with credentials from `~/.hermes/.env` (`$LIDL_USER`, `$LIDL_PW`). Because this runs in the user's real Chrome (not a temp profile), reCAPTCHA trusts the session. Then fetch receipts from the authenticated context.
+   e. This is the single unified path — always try Playwright MCP first for both login and data fetching.
 
 **2. Copied cookie** — If the user has a Lidl session open in their browser and can copy the `Cookie` header from a receipt API request, use `--cookie-stdin` or `LIDL_COOKIE` env var. This is the right path for VM/headless/remote agent environments with no browser UI.
 
@@ -117,23 +118,40 @@ Use `--data-dir`, `--country`, `--language-code`, or `--rate` only when the user
 
 Use `--insecure` only when the local Python TLS trust store rejects the connection with a certificate-chain error in a controlled environment.
 
-## Browser-session API fallback
+## Browser-session API fallback (PREFERRED PATH)
 
-Use this when Playwright MCP / computer-use can access the user's logged-in Chrome session and the helper script's `--login` path cannot bootstrap auth quickly. This avoids reading or typing saved passwords.
+Use this whenever Playwright MCP is connected to the user's running Chrome session. This is the **primary** auth path for this skill because:
 
-1. Navigate to the Lidl account page and verify it is already logged in:
+- It uses the user's **real Chrome** — no temp profile, no reCAPTCHA flagging
+- The user keeps Lidl logged in day-to-day, so often no login needed
+- If login is needed, credential submission happens in a real browser that reCAPTCHA trusts
+- Saved credentials from `~/.hermes/.env` (`LIDL_USER`, `LIDL_PW`) can be used for MCP-driven form fills
+
+### Workflow
+
+1. **Navigate to the Lidl account page via Playwright MCP:**
 
 ```text
 https://www.lidl.co.uk/mla/?country_code=gb&language=en-GB&client_id=GreatBritainRetailClient
 ```
 
-2. Find the local checkpoint from existing summaries:
+2. **Check if already logged in.** If the page shows an account greeting (e.g. "My account", order history, etc.), skip to step 4. If redirected to `accounts.lidl.com/Account/Login`, proceed to step 3.
+
+3. **Login via Playwright MCP (only if redirected to login page).** Use `browser_find` and `browser_type` / `browser_click` on the MCP-connected page to fill credentials from the environment:
+
+   - Email field: locate `[data-testid="input-email"]` or the email textbox → type `$LIDL_USER` → click the "Next" button
+   - Password field: locate `[data-testid="login-input-password"]` → type `$LIDL_PW` → click the login button
+   - Wait for redirect back to `www.lidl.co.uk/mla/`
+
+   Because these interactions go through the user's real Chrome (Playwright MCP Chrome extension mode), reCAPTCHA sees a legitimate browser session and should accept the login.
+
+4. **Find the local checkpoint** from existing summaries:
 
 ```bash
 python3 scripts/lidl_receipts.py --data-dir /Users/yanzhongsu/data status
 ```
 
-3. From the authenticated page context, fetch new summaries and details with `fetch(..., {credentials: 'include'})`. Lidl summary pages are 1-indexed; `page=0` returns `400`, while `page=1` returns the newest receipts.
+5. **From the authenticated page context** (still on `www.lidl.co.uk`), fetch new summaries and details with the browser console:
 
 ```js
 async () => {
@@ -146,18 +164,18 @@ async () => {
     const r = await fetch(`https://www.lidl.co.uk/mre/api/v1/tickets/${s.id}?country=GB&languageCode=en-GB`, {credentials: 'include'});
     details[s.id] = await r.json();
   }
-  return {fetched_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'), summariesPayload, newSummaries, details};
+  return {fetched_at: new Date().toISOString().replace(/\\.\\d{3}Z$/, 'Z'), summariesPayload, newSummaries, details};
 }
 ```
 
-4. Save each `details[id]` to `./data/receipts/{id}.json`, prepend/merge `newSummaries` into `./data/receipts_summaries.json` without duplicating ids, update `./data/receipts/_manifest.json`, then run:
+6. **Save results locally:** Save each `details[id]` to `./data/receipts/{id}.json`, prepend/merge `newSummaries` into `./data/receipts_summaries.json` without duplicating ids, update `./data/receipts/_manifest.json`, then run:
 
 ```bash
 python3 scripts/lidl_receipts.py --data-dir /Users/yanzhongsu/data parse
 python3 scripts/lidl_receipts.py --data-dir /Users/yanzhongsu/data status
 ```
 
-5. Report the new receipts only. Never print or store cookies, `authToken`, `customer-info`, `ldi-session-info`, or other browser credential values.
+7. **Report the new receipts only.** Never print or store cookies, `authToken`, `customer-info`, `ldi-session-info`, or other browser credential values.
 
 ## Efficient Query Recipes
 
