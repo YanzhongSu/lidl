@@ -158,8 +158,11 @@ def validate_cookie(args: argparse.Namespace, cookie: str) -> bool:
 
 
 def resolve_login_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    email = args.email or os.environ.get("LIDL_EMAIL")
-    password = os.environ.get("LIDL_PASSWORD")
+    email = args.email or os.environ.get("LIDL_EMAIL") or os.environ.get("LIDL_USER")
+    password = (
+        os.environ.get("LIDL_PASSWORD")
+        or os.environ.get("LIDL_PW")
+    )
 
     if args.password_stdin:
         password = sys.stdin.readline().rstrip("\n")
@@ -168,12 +171,16 @@ def resolve_login_credentials(args: argparse.Namespace) -> tuple[str, str]:
         if sys.stdin.isatty():
             email = input("Lidl email: ").strip()
         else:
-            raise SystemExit("Missing Lidl email. Provide --email or set LIDL_EMAIL.")
+            raise SystemExit(
+                "Missing Lidl email. Provide --email, set LIDL_EMAIL, or set LIDL_USER."
+            )
     if not password:
         if sys.stdin.isatty():
             password = getpass.getpass("Lidl password: ")
         else:
-            raise SystemExit("Missing Lidl password. Set LIDL_PASSWORD or pass --password-stdin.")
+            raise SystemExit(
+                "Missing Lidl password. Set LIDL_PASSWORD, set LIDL_PW, or pass --password-stdin."
+            )
 
     return email, password
 
@@ -188,10 +195,21 @@ def login_with_browser(args: argparse.Namespace) -> str:
             "`python3 -m pip install playwright` and `python3 -m playwright install chromium`."
         ) from exc
 
+    import random
+
     state_path = auth_state_path(args)
-    headed = args.auth_headed or args.auth_interactive
+    # Use headed mode + real Chrome channel for credential login — Lidl detects
+    # headless Chromium automation. When --auth-interactive is set the user
+    # completes login manually anyway. When credentials are used automatically
+    # we still launch headed so Playwright's automation signatures are less
+    # obvious (full Chrome vs minimal Chromium).
+    headed = True if (args.auth_headed or args.login) else args.auth_interactive
+    launch_kwargs: dict[str, Any] = {"headless": not headed}
+    if args.auth_browser_channel or (args.login and not args.auth_browser_channel):
+        launch_kwargs["channel"] = args.auth_browser_channel or "chrome"
+
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=not headed, channel=args.auth_browser_channel)
+        browser = playwright.chromium.launch(**launch_kwargs)
 
         if state_path and state_path.exists():
             context = browser.new_context(locale="en-GB", storage_state=str(state_path))
@@ -209,8 +227,30 @@ def login_with_browser(args: argparse.Namespace) -> str:
             context.close()
             print_err("Saved Lidl browser auth state is missing or expired; logging in again.")
 
-        context = browser.new_context(locale="en-GB")
+        context = browser.new_context(
+            locale="en-GB",
+            viewport={"width": 1440, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+        )
         page = context.new_page()
+
+        # Hide Playwright/automation fingerprints that Lidl's anti-bot checks for
+        page.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});
+            // Override chrome.runtime if exposed by Playwright
+            if (window.chrome && window.chrome.runtime) {
+                Object.defineProperty(window.chrome, 'runtime', {get: () => undefined});
+            }
+            """
+        )
+
         page.goto(LIDL_HOME_URL, wait_until="domcontentloaded", timeout=args.auth_timeout * 1000)
 
         if args.auth_interactive:
@@ -220,14 +260,22 @@ def login_with_browser(args: argparse.Namespace) -> str:
             )
         elif "accounts.lidl.com" in page.url:
             email, password = resolve_login_credentials(args)
+            page.wait_for_timeout(random.randint(800, 2000))
+
             email_input = page.locator('[data-testid="input-email"], #input-email').first
             email_input.wait_for(state="visible", timeout=args.auth_timeout * 1000)
-            email_input.fill(email)
+            page.wait_for_timeout(random.randint(300, 800))
+            # Use press_sequentially to simulate human typing (bypasses fill detection)
+            email_input.press_sequentially(email, delay=random.randint(30, 80))
+            page.wait_for_timeout(random.randint(500, 1200))
             page.locator('[data-testid="login-or-register-submit-button"]').click(timeout=15_000)
 
+            page.wait_for_timeout(random.randint(1000, 2500))
             password_input = page.locator('[data-testid="login-input-password"], #Password').first
             password_input.wait_for(state="visible", timeout=args.auth_timeout * 1000)
-            password_input.fill(password)
+            page.wait_for_timeout(random.randint(300, 800))
+            password_input.press_sequentially(password, delay=random.randint(30, 80))
+            page.wait_for_timeout(random.randint(500, 1200))
             page.locator('[data-testid="button-primary"]').click(timeout=15_000)
 
         try:
@@ -275,7 +323,7 @@ def require_cookie(args: argparse.Namespace) -> str:
     if not cookie:
         raise SystemExit(
             "Missing Lidl authentication. Provide --cookie, set LIDL_COOKIE, or use --login with "
-            "LIDL_EMAIL and LIDL_PASSWORD."
+            "LIDL_USER/LIDL_EMAIL and LIDL_PW/LIDL_PASSWORD."
         )
     setattr(args, "_cookie_value", cookie)
     return cookie
@@ -824,7 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cookie", help="Full Lidl Cookie header. Prefer LIDL_COOKIE instead.")
     parser.add_argument("--cookie-stdin", action="store_true", help="Read the full Lidl Cookie header from stdin.")
     parser.add_argument("--login", action="store_true", help="Use Playwright to log in with Lidl credentials.")
-    parser.add_argument("--email", help="Lidl login email. Prefer LIDL_EMAIL for agent runs.")
+    parser.add_argument("--email", help="Lidl login email. Prefer LIDL_EMAIL or LIDL_USER for agent runs.")
     parser.add_argument("--password-stdin", action="store_true", help="Read the Lidl password from the first stdin line.")
     parser.add_argument(
         "--auth-state",

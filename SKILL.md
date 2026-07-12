@@ -32,7 +32,7 @@ Authentication decision:
 - If the agent is on a VM/headless/remote environment without browser UI, ask the user for the full `Cookie` request header from a logged-in Lidl browser request and use `--cookie-stdin` or `LIDL_COOKIE`.
 - If the agent can access the user's already logged-in Chrome session and the page is authenticated (`/mla/` shows the account page), use the browser-session API fallback below before asking for cookies or passwords.
 - If, and only if, the agent is definitely on a local machine with interactive browser UI, use `--login` to reuse `./data/lidl_auth_state.json`. If that state is missing or expired, use `auth-check --login --auth-interactive` and ask the user to complete the login in the opened browser.
-- Do not attempt headless credential login as the primary strategy. Lidl may reject automated credential submission with `Oops! something went wrong, please try again later.`
+- Automated credential login (`--login`) can attempt to log in without user interaction if `LIDL_USER`/`LIDL_EMAIL` and `LIDL_PW`/`LIDL_PASSWORD` are set in the environment. The script launches headed Chrome (not headless) with anti-bot mitigations: `navigator.webdriver` hidden, `press_sequentially()` for human-like typing, realistic viewport/user-agent, and random delays between actions. Lidl's anti-bot may still reject automated login — fall back to `--auth-interactive` or the browser-session API fallback if it fails.
 
 Full export workflow:
 
@@ -48,9 +48,10 @@ Authentication notes:
 - Lidl UK uses an OpenID Connect authorization-code flow with PKCE through `accounts.lidl.com`.
 - Successful login redirects back to `www.lidl.co.uk/user-api/signin-oidc`, which sets first-party cookies used by `/mre/api/v1/tickets`.
 - Relevant post-login receipt cookies include `ldi-user-context`, `authToken`, `ldi-session-info`, `ldi-customertoken`, `tracking-info`, and `customer-info`.
-- Headless credential submission may be rejected by Lidl's bot checks with `Oops! something went wrong, please try again later.` Do not try to bypass that.
-- On VMs or headless agent environments without browser UI, copied-cookie mode is the recommended path. Ask the user for the full `Cookie` request header and pass it through `LIDL_COOKIE` or `--cookie-stdin`.
-- For agent credentials, prefer `LIDL_EMAIL` and `LIDL_PASSWORD` environment variables or `--email` plus `--password-stdin`; never store passwords in the repo.
+- Lidl uses **Google reCAPTCHA Enterprise** (invisible v3) and **FingerprintJS** on the login page. This means automated credential login (`--login` without `--auth-interactive`) will almost certainly be rejected — reCAPTCHA scores Playwright-driven sessions as bot-like regardless of anti-detection mitigations. This is expected and not a bug.
+- For agent credentials, the script supports `LIDL_USER`/`LIDL_EMAIL` for email and `LIDL_PW`/`LIDL_PASSWORD` for password (set in `~/.hermes/.env`). These are used by `resolve_login_credentials()`.
+- **If automated login fails** (expected): use `--auth-interactive` once to complete the login manually in the opened browser. The saved auth state (`lidl_auth_state.json`) will be reused on subsequent `--login` runs until it expires.
+- **Best path for automated refresh**: use the browser-session API fallback (Playwright MCP access to already-logged-in Chrome) — navigate to `/mla/`, verify logged-in state, then use `fetch(...)` from the page context with `credentials: 'include'`.
 
 ## Commands
 
